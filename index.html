@@ -84,7 +84,7 @@
 </head>
 <body>
 <header>
-  <h1>📦 分貨 <small>v2.4</small></h1>
+  <h1>📦 分貨 <small>v2.5</small></h1>
   <span id="qBadge">☁️ 0</span>
   <select id="weekSel" onchange="changeWeek(this.value)"></select>
 </header>
@@ -489,10 +489,13 @@ function parseQR(text) {
   const h = text.indexOf('#'); if (h < 0) return null;
   const dec = x => { try { return decodeURIComponent(String(x).replace(/\+/g, ' ')); } catch (e) { return String(x); } };
   const parts = text.slice(h + 1).split('|').map(dec);
-  if (parts[0] === 'L1' && parts.length >= 4) {
-    const price = parseInt(String(parts[3]).replace(/[^\d]/g, ''), 10);
-    return { fb: text.slice(0, h), ver: 'L1', name: (parts[1] || '').trim(), item: (parts[2] || '').trim(), price: isNaN(price) ? '' : price, part: parts[5] || '' };
-  }
+  const num = x => { const n = parseInt(String(x || '').replace(/[^\d]/g, ''), 10); return isNaN(n) ? '' : n; };
+  // L1：網址#L1|名字|品名|金額|數量|第幾張
+  if (parts[0] === 'L1' && parts.length >= 4)
+    return { fb: text.slice(0, h), ver: 'L1', name: (parts[1] || '').trim(), item: (parts[2] || '').trim(), price: num(parts[3]), part: parts[5] || '' };
+  // L2：網址#L2|日期|名字|品名|金額|數量|第幾張（喊單讀取器 0.8.6 起）
+  if (parts[0] === 'L2' && parts.length >= 5)
+    return { fb: text.slice(0, h), ver: 'L2', date: parts[1] || '', name: (parts[2] || '').trim(), item: (parts[3] || '').trim(), price: num(parts[4]), part: parts[6] || '' };
   return null;
 }
 
@@ -536,9 +539,9 @@ function acceptLabel(txt, c) {
   cur = { fb: '', part: '', qrRaw: p ? txt : '', labelPhoto: c.toDataURL('image/jpeg', 0.85) };
   if (p) {
     const star = starNameOf(p.name);
-    Object.assign(cur, { name: star || p.name, rawName: p.name, item: p.item, price: p.price, fb: p.fb, part: p.part, source: `🏷️ QR ${p.ver}${p.part ? '（' + p.part + '）' : ''}` + (star && star !== p.name ? `　🔗 標籤「${p.name}」→「${star}」` : '') });
+    Object.assign(cur, { name: star || p.name, rawName: p.name, item: p.item, price: p.price, fb: p.fb, part: p.part, source: `🏷️ QR ${p.ver}${p.date ? ' ' + p.date.slice(4, 6) + '/' + p.date.slice(6, 8) : ''}${p.part ? '（' + p.part + '）' : ''}${p.price === '' ? '　⚠️ 標籤沒有金額，請手動填' : ''}` + (star && star !== p.name ? `　🔗 標籤「${p.name}」→「${star}」` : '') });
   }
-  else Object.assign(cur, { name: '', item: '', price: '', source: '⚠️ QR 格式看不懂：' + txt.slice(0, 50) });
+  else Object.assign(cur, { name: '', item: '', price: '', source: '⚠️ QR 格式看不懂：' + txt });
   if (navigator.vibrate) navigator.vibrate(60);
   showData();
 }
