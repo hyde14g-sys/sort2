@@ -84,7 +84,7 @@
 </head>
 <body>
 <header>
-  <h1>📦 分貨 <small>v2.3</small></h1>
+  <h1>📦 分貨 <small>v2.4</small></h1>
   <span id="qBadge">☁️ 0</span>
   <select id="weekSel" onchange="changeWeek(this.value)"></select>
 </header>
@@ -135,7 +135,7 @@
   </div>
 
   <div class="card" style="margin-top:10px">
-    <div class="row" style="margin-bottom:6px"><b style="flex:1">🕘 這支手機最近存的</b><span class="muted" id="logSum" style="flex:none"></span></div>
+    <div class="row" style="margin-bottom:6px"><b style="flex:1">🕘 這支手機最近存的</b><span class="muted" id="logSum" style="flex:none"></span><button style="flex:none;padding:4px 10px;font-size:0.75rem" onclick="clearLog()">清空</button></div>
     <div class="log" id="logList"></div>
   </div>
 </div>
@@ -280,6 +280,10 @@
       const s = await getDocs(query(collection(db, "sort_items"), where("week", "==", week), where("name", "==", name)));
       return s.docs.map(d => d.data()).sort((a, b) => a.ts - b.ts);
     },
+    async existing(ids) {
+      const res = await Promise.all(ids.map(id => getDoc(doc(db, "sort_items", id)).then(d => d.exists() ? id : null)));
+      return new Set(res.filter(Boolean));
+    },
     async getPhoto(path) { return await getBlob(ref(storage, path)); },
     async deleteItem(it, adjustWeek = true) {
       try { await deleteObject(ref(storage, it.path)); } catch (e) { if (e.code !== 'storage/object-not-found') throw e; }
@@ -397,6 +401,30 @@ function setLog(id, patch) {
     const r = l.find(x => x.id === id); if (r) { Object.assign(r, patch); localStorage.setItem(k, JSON.stringify(l)); }
   }
   renderLog();
+}
+function dropLog(id) {
+  for (const k of Object.keys(localStorage).filter(k => k.startsWith('sort2_log_'))) {
+    let l; try { l = JSON.parse(localStorage.getItem(k)); } catch (e) { continue; }
+    const n = l.filter(x => x.id !== id); if (n.length !== l.length) localStorage.setItem(k, JSON.stringify(n));
+  }
+  renderLog();
+}
+function clearLog() {
+  if (!confirm('清空這支手機的拍照紀錄？\n（只清除這個清單，雲端的照片不會被刪除）')) return;
+  localStorage.removeItem(logKey()); renderLog();
+}
+// 跟雲端核對：別的手機刪掉的、或在合併傳送刪掉的，從清單移除（只核對最近 50 筆已上傳的）
+let syncingLog = false;
+async function syncLog() {
+  if (syncingLog || !window.sortApi || !window.sortApi.existing) return;
+  const ids = getLog().filter(x => x.state === 'up').slice(-50).map(x => x.id);
+  if (!ids.length) return;
+  syncingLog = true;
+  try {
+    const ok = await window.sortApi.existing(ids);
+    const gone = new Set(ids.filter(id => !ok.has(id)));
+    if (gone.size) { putLog(getLog().filter(x => !gone.has(x.id))); renderLog(); }
+  } catch (e) { console.warn('核對紀錄失敗', e); } finally { syncingLog = false; }
 }
 function renderLog() {
   const l = getLog();
@@ -623,6 +651,7 @@ async function undoLast() {
   try {
     if (inQ) await qdb('readwrite', s => s.delete(r.id));
     else { const items = await window.sortApi.listCustomer(week, r.name); const it = items.find(x => x.id === r.id); if (it) await window.sortApi.deleteItem(it); }
+    dropLog(r.id);
     l.pop(); putLog(l); weekData = null; renderLog(); await qRefresh(); toast('已復原');
   } catch (e) { alert('復原失敗：' + e.message); }
 }
@@ -664,6 +693,7 @@ function updateBar() {
   document.querySelectorAll('#actBar .ab').forEach(x => x.classList.toggle('on', x.dataset.st === stage));
 }
 function showView(v) {
+  if (v === 'vShoot') syncLog();
   document.querySelectorAll('.view').forEach(x => x.classList.toggle('on', x.id === v));
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x.dataset.v === v));
   if (v !== 'vShoot' && !weekData) loadWeek();
@@ -808,6 +838,7 @@ async function editPrice(i) {
     const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.85));
     const newPath = it.path.replace(/_(\d+)_([^_]+)\.jpg$/, `_${price}_$2.jpg`);
     const upd = await window.sortApi.changePrice(it, price, blob, newPath);
+    setLog(it.id, { price });
     blobCache.delete(it.path); blobCache.set(newPath, blob);
     if (it._url) URL.revokeObjectURL(it._url);
     dItems[i] = { ...upd, _url: URL.createObjectURL(blob) };
@@ -820,6 +851,7 @@ async function deleteItem(i) {
   if (!confirm(`刪除第 ${i + 1} 件（${money(it.price)}）？照片也會刪除`)) return;
   try {
     await window.sortApi.deleteItem(it);
+    dropLog(it.id);
     dItems.splice(i, 1); dSel = dSel.filter(x => x !== i).map(x => x > i ? x - 1 : x);
     if (weekData && weekData.counts[dName]) { weekData.counts[dName].n--; weekData.counts[dName].sum -= it.price; }
     resetMerge(); renderDetail(); toast('已刪除');
@@ -840,7 +872,7 @@ document.addEventListener('keydown', e => {   // 電腦鍵盤也能用
 });
 fillWeekSel(); renderLog(); setStage('scan');
 window.onFirebaseReady = async function () {
-  qRefresh(); processQueue();
+  qRefresh(); processQueue(); syncLog();
   await startCamera(localStorage.getItem('sort2_cam') || undefined);
 };
 
