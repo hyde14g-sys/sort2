@@ -84,7 +84,7 @@
 </head>
 <body>
 <header>
-  <h1>📦 分貨 <small>v2.7</small></h1>
+  <h1>📦 分貨 <small>v2.8</small></h1>
   <span id="qBadge">☁️ 0</span>
   <select id="weekSel" onchange="changeWeek(this.value)"></select>
 </header>
@@ -257,6 +257,10 @@
   try { const a = await getDoc(doc(db, "meta", "sortAliases")); window.sortAliases = a.exists() ? (a.data().map || {}) : {}; }
   catch (e) { window.sortAliases = {}; }
 
+  // v2.8：FB 帳號 → 顯示名字（同名不同人分開）{ map: { fbKey: { raw, disp } } }
+  try { const f = await getDoc(doc(db, "meta", "sortFb")); window.sortFb = f.exists() ? (f.data().map || {}) : {}; }
+  catch (e) { window.sortFb = {}; }
+
   const LIMIT_BYTES = 4.5e9, TARGET_BYTES = 4.4e9;
 
   window.sortApi = {
@@ -271,6 +275,14 @@
     async saveAlias(star, raw) {
       await setDoc(doc(db, "meta", "sortAliases"), { map: { [star]: raw } }, { merge: true });
       window.sortAliases[star] = raw;
+    },
+    async reloadFb() {
+      try { const f = await getDoc(doc(db, "meta", "sortFb")); window.sortFb = f.exists() ? (f.data().map || {}) : {}; } catch (e) {}
+      return window.sortFb;
+    },
+    async saveFb(key, entry) {
+      await setDoc(doc(db, "meta", "sortFb"), { map: { [key]: entry } }, { merge: true });
+      window.sortFb[key] = entry;
     },
     async getWeek(week) {
       const s = await getDoc(doc(db, "sort_weeks", week));
@@ -552,18 +564,52 @@ function noLabel() {
   cur = { name: '', item: '', price: '', fb: '', part: '', qrRaw: '', source: '✍️ 沒有標籤：手動輸入（看包裝上的手寫）', labelPhoto: c ? c.toDataURL('image/jpeg', 0.85) : '' };
   showData();
 }
-function acceptLabel(txt, c) {
+async function acceptLabel(txt, c) {
   blockedQR = txt; gone = 0;
   const p = parseQR(txt);
   cur = { fb: '', part: '', qrRaw: p ? txt : '', labelPhoto: c.toDataURL('image/jpeg', 0.85) };
   if (p) {
     const star = starNameOf(p.name);
-    Object.assign(cur, { name: star || p.name, rawName: p.name, item: p.item, price: p.price, fb: p.fb, part: p.part, source: `🏷️ QR ${p.ver}${p.date ? ' ' + p.date.slice(4, 6) + '/' + p.date.slice(6, 8) : ''}${p.part ? '（' + p.part + '）' : ''}${p.price === '' ? '　⚠️ 標籤沒有金額，請手動填' : ''}` + (star && star !== p.name ? `　🔗 標籤「${p.name}」→「${star}」` : '') });
+    const key = fbKey(p.fb);
+    const disp = key ? await resolveFb(key, p.name, star || p.name) : (star || p.name);
+    cur.fbKey = key; cur.fbDisp = key ? disp : '';
+    Object.assign(cur, { name: disp, rawName: p.name, item: p.item, price: p.price, fb: p.fb, part: p.part, source: `🏷️ QR ${p.ver}${p.date ? ' ' + p.date.slice(4, 6) + '/' + p.date.slice(6, 8) : ''}${p.part ? '（' + p.part + '）' : ''}${p.price === '' ? '　⚠️ 標籤沒有金額，請手動填' : ''}` + (disp !== p.name ? `　🔗 標籤「${p.name}」→「${disp}」` : '') + (key ? '　👤 FB 已辨識' : '') });
   }
   else Object.assign(cur, { name: '', item: '', price: '', source: '⚠️ QR 格式看不懂：' + txt });
   if (navigator.vibrate) navigator.vibrate(60);
   showData();
 }
+// ── FB 帳號分人（v2.8）──
+function fbKey(u) {
+  if (!u) return '';
+  try { const x = new URL(u, 'https://www.facebook.com'); const id = x.searchParams.get('id'); return (x.pathname.replace(/\/+$/, '') + (id ? '?id=' + id : '')).toLowerCase(); }
+  catch (e) { return ''; }
+}
+const CIRC = ['', '', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨'];
+function fbEntries() { return Object.entries(window.sortFb || {}); }
+function dispTaken(d) { return fbEntries().some(([, v]) => v.disp === d); }
+// 這個名字有幾位不同的人（不同 FB）
+function sameNameDisps(name) {
+  const raws = new Set(fbEntries().filter(([, v]) => v.raw === name || v.disp === name).map(([, v]) => v.raw));
+  return [...new Set(fbEntries().filter(([, v]) => raws.has(v.raw)).map(([, v]) => v.disp))];
+}
+async function resolveFb(key, raw, base) {
+  if (!(window.sortFb || {})[key]) await window.sortApi.reloadFb();   // 另一支手機可能剛記過
+  const map = window.sortFb || {};
+  if (map[key]) return map[key].disp;
+  const others = fbEntries().filter(([k, v]) => k !== key && v.raw === raw).map(([, v]) => v.disp);
+  let disp = base;
+  if (others.length) {
+    let n = others.length + 1, def = base + (CIRC[n] || '#' + n);
+    while (dispTaken(def)) { n++; def = base + (CIRC[n] || '#' + n); }
+    const v = prompt(`又一位「${raw}」（不同的 FB 帳號）\n已經有：${others.join('、')}\n\n這位要叫什麼？（以後掃到這個 FB 都會用這個名字）`, def);
+    disp = (v || '').trim() || def;
+    if (dispTaken(disp)) disp = def;
+  }
+  try { await window.sortApi.saveFb(key, { raw, disp }); } catch (e) { console.warn('記住 FB 失敗', e); }
+  return disp;
+}
+
 // ── 名字對應（v2.3）──
 const normName = n => String(n || '').replace(/[（(][^）)]*[）)]/g, '').replace(/[\s　@#＠]/g, '').toLowerCase();
 function starNameOf(raw) {
@@ -579,10 +625,12 @@ function similarNames(raw) {
 async function pickAlias(star) {
   const raw = cur && cur.rawName; if (!raw) return;
   $('pName').value = star; updateWarn(); renderSuggest();
+  if (cur.fbKey && cur.fbDisp === raw) { cur.fbDisp = star; window.sortApi.saveFb(cur.fbKey, { raw, disp: star }).catch(e => console.warn(e)); }
   try { await window.sortApi.saveAlias(star, raw); toast(`✅ 已記住：「${raw}」＝「${star}」`); }
   catch (e) { alert('記住名字失敗：' + e.message); }
 }
 document.addEventListener('click', e => { const a = e.target.closest('[data-aliasto]'); if (a) pickAlias(a.dataset.aliasto); });
+document.addEventListener('click', e => { const a = e.target.closest('[data-pickdisp]'); if (a && cur) { $('pName').value = a.dataset.pickdisp; cur._sameOk = a.dataset.pickdisp; renderSuggest(); updateWarn(); } });
 
 function showData() {
   setStage('data');
@@ -595,10 +643,12 @@ function updateWarn() {
   if (stage !== 'data') return;
   const name = $('pName').value.trim(), w = [];
   const all = window.customerNames || [];
-  const notIn = name && all.length && !all.includes(name);
+  const notIn = name && all.length && !all.includes(name) && !(cur.fbDisp && cur.fbDisp !== cur.rawName && name === cur.fbDisp);
   const sim = notIn && cur.rawName && name === cur.rawName ? similarNames(name) : [];
   if (sim.length) w.push(`標籤上的「${esc(name)}」不在名單裡，是這位嗎？（選一次就會記住）<div style="margin-top:6px">` + sim.map(x => `<span class="chip sug" data-aliasto="${esc(x)}" style="margin:0 6px 6px 0">✅ ${esc(x)}</span>`).join('') + '</div>');
   else if (notIn && !all.some(n => n.includes(name))) w.push(`「${esc(name)}」不在客戶名單裡（新客人或名字有誤）`);
+  const same = !cur.fbKey && name ? sameNameDisps(name) : [];
+  if (same.length > 1 && fbEntries().some(([, v]) => v.raw === name)) w.push(`有 ${same.length} 位不同的人叫「${esc(name)}」，這件是誰的？<div style="margin-top:6px">` + same.map(x => `<span class="chip sug" data-pickdisp="${esc(x)}" style="margin:0 6px 6px 0">👤 ${esc(x)}</span>`).join('') + '</div>');
   const last = getLog().slice(-1)[0];
   if (last && cur.qrRaw && last.qrRaw === cur.qrRaw) w.push('跟上一件的標籤完全相同，確定是另一件嗎？');
   $('pWarn').innerHTML = w.map(x => `<div class="warn">⚠️ ${x}</div>`).join('');
@@ -610,6 +660,13 @@ function confirmData() {
   const price = parseInt($('pPrice').value.replace(/[^\d]/g, ''), 10);
   if (!name) { toast('請填客人名字', 'var(--red)'); $('pName').focus(); return; }
   if (isNaN(price)) { toast('請填金額', 'var(--red)'); $('pPrice').focus(); return; }
+  if (!cur.fbKey && cur._sameOk !== name && sameNameDisps(name).length > 1 && fbEntries().some(([, v]) => v.raw === name)) {
+    if (!confirm(`有好幾位叫「${name}」的客人，確定用「${name}」嗎？\n（建議點上面的名字選是哪一位）`)) return;
+    cur._sameOk = name;
+  }
+  if (cur.fbKey && name !== cur.fbDisp && cur.fbDisp && confirm(`以後這個 FB 帳號都叫「${name}」嗎？\n（按取消＝只有這件用「${name}」）`)) {
+    window.sortApi.saveFb(cur.fbKey, { raw: cur.rawName, disp: name }).catch(e => console.warn(e)); cur.fbDisp = name;
+  }
   Object.assign(cur, { name, item, price });
   if (document.activeElement) document.activeElement.blur();
   $('whoPhoto').innerHTML = `${esc(name)}　<span>${money(price)}</span>`;
@@ -657,7 +714,7 @@ async function savePhoto() {
   if (stage !== 'preview' || !cur || !cur.blob) return;
   const sn = safeName(cur.name), id = stampId();
   const file = `${sn}_${cur.price}_${id}.jpg`;
-  const item = { id, week, name: cur.name, item: cur.item || '', price: cur.price, fb: cur.fb || '', part: cur.part || '', source: cur.qrRaw ? 'qr' : 'manual', path: `sort/${week}/${sn}/${file}`, file, size: cur.blob.size, w: cur.w, h: cur.h, stripH: cur.stripH, ts: Date.now(), by: window.currentUser || '' };
+  const item = { id, week, name: cur.name, item: cur.item || '', price: cur.price, fb: cur.fb || '', fbKey: cur.fbKey || '', part: cur.part || '', source: cur.qrRaw ? 'qr' : 'manual', path: `sort/${week}/${sn}/${file}`, file, size: cur.blob.size, w: cur.w, h: cur.h, stripH: cur.stripH, ts: Date.now(), by: window.currentUser || '' };
   const l = getLog(); l.push({ id, name: cur.name, price: cur.price, item: cur.item, qrRaw: cur.qrRaw, state: 'q' }); putLog(l);
   pushRecent(cur.name);
   await enqueue(item, cur.blob);
