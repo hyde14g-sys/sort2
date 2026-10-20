@@ -84,7 +84,7 @@
 </head>
 <body>
 <header>
-  <h1>📦 分貨 <small>v2.8</small></h1>
+  <h1>📦 分貨 <small>v2.9</small></h1>
   <span id="qBadge">☁️ 0</span>
   <select id="weekSel" onchange="changeWeek(this.value)"></select>
 </header>
@@ -176,7 +176,8 @@
   <div class="card">
     <b>📋 本週總覽</b>
     <div id="weekSummary" style="margin-top:8px;line-height:1.9"></div>
-    <button style="margin-top:8px" onclick="loadWeek()">↻ 重新整理</button> <button style="margin-top:8px" id="recountBtn" onclick="recountWeek()">🔄 重新計算</button>
+    <div id="storageBox" style="margin-top:6px;line-height:1.7"></div>
+    <button style="margin-top:8px" onclick="loadWeek();loadStorage()">↻ 重新整理</button> <button style="margin-top:8px" id="recountBtn" onclick="recountWeek()">🔄 重新計算</button>
   </div>
   <div class="card muted" style="line-height:1.8">
     ・照片存在雲端，兩支手機會看到同一份資料<br>
@@ -284,6 +285,7 @@
       await setDoc(doc(db, "meta", "sortFb"), { map: { [key]: entry } }, { merge: true });
       window.sortFb[key] = entry;
     },
+    async getStorage() { const s = await getDoc(doc(db, "meta", "sortStorage")); return s.exists() ? (s.data().bytes || 0) : 0; },
     async getWeek(week) {
       const s = await getDoc(doc(db, "sort_weeks", week));
       return s.exists() ? s.data() : { week, counts: {}, sent: {} };
@@ -780,6 +782,7 @@ function showView(v) {
   document.querySelectorAll('.view').forEach(x => x.classList.toggle('on', x.id === v));
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x.dataset.v === v));
   if (v !== 'vShoot' && !weekData) loadWeek();
+  if (v === 'vWeek') loadStorage();
   updateBar();
   window.scrollTo(0, 0);
 }
@@ -791,6 +794,18 @@ async function loadWeek() {
   $('weekInfo').textContent = '讀取中...';
   try { weekData = await window.sortApi.getWeek(week); } catch (e) { $('weekInfo').textContent = '❌ ' + e.message; return; }
   renderWeek();
+}
+// v2.9：照片空間（1 次讀取，只在打開「本週」時讀）
+async function loadStorage() {
+  if (!window.firebaseReady) return;
+  const box = $('storageBox'); box.innerHTML = '<span class="muted">照片空間：讀取中...</span>';
+  try {
+    const b = Math.max(0, await window.sortApi.getStorage()), LIM = 4.5e9, pct = Math.min(100, b / LIM * 100);
+    const gb = x => (x / 1e9).toFixed(2), col = pct >= 90 ? 'var(--red)' : pct >= 70 ? '#fb923c' : '#4ade80';
+    box.innerHTML = `照片空間：<b>${gb(b)} GB</b> / 4.5 GB（${pct.toFixed(0)}%）`
+      + `<div style="height:10px;border-radius:5px;background:#2a2a36;overflow:hidden;margin-top:4px"><div style="height:100%;width:${pct}%;background:${col}"></div></div>`
+      + (pct >= 90 ? '<div style="color:var(--red);font-size:0.85rem">⚠️ 快滿了，之後會自動刪最舊的照片</div>' : '');
+  } catch (e) { box.innerHTML = '<span class="muted">照片空間：讀取失敗（' + esc(e.message) + '）</span>'; }
 }
 function weekCustomers() {
   const c = (weekData && weekData.counts) || {}, sent = (weekData && weekData.sent) || {};
