@@ -84,7 +84,7 @@
 </head>
 <body>
 <header>
-  <h1>📦 分貨 <small>v2.5</small></h1>
+  <h1>📦 分貨 <small>v2.6</small></h1>
   <span id="qBadge">☁️ 0</span>
   <select id="weekSel" onchange="changeWeek(this.value)"></select>
 </header>
@@ -672,14 +672,18 @@ async function aiRecognize() {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': localStorage.getItem('claude_api_key'), 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
-      body: JSON.stringify({ model: localStorage.getItem('claude_ai_model') || 'claude-haiku-5-5', max_tokens: 300, messages: [{ role: 'user', content: [
+      body: JSON.stringify({ model: localStorage.getItem('claude_ai_model') || 'claude-haiku-5-5', max_tokens: 512, thinking: { type: 'disabled' }, messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: cur.labelPhoto.split(',')[1] } },
         { type: 'text', text: '照片中是服飾包裝，上面有印刷標籤或手寫的客人名字和金額。印刷標籤格式：「史塔兔服飾小物」（忽略）、客人姓名（大字）、品名、「$數字」是金額；「1/2」是件數、「10/17 20:50」是日期，都不是金額。手寫的通常是名字和數字金額。只回傳 JSON：{"name":"客人姓名","item":"品名","price":金額數字}，看不清楚的給空字串。' }
       ] }] })
     });
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(res.status + ' ' + (e.error?.message || '')); }
-    const d = await res.json(), txt = (d.content || []).find(b => b.type === 'text')?.text || '';
-    const j = JSON.parse(txt.replace(/^```(json)?\s*/i, '').replace(/\s*```\s*$/, ''));
+    const d = await res.json();
+    const txt = (d.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+    if (!txt) throw new Error('AI 沒有回傳文字（' + (d.stop_reason || '未知原因') + '），請再按一次');
+    const mm = txt.match(/\{[\s\S]*\}/);
+    if (!mm) throw new Error('看不懂 AI 的回答：' + txt.slice(0, 80));
+    let j; try { j = JSON.parse(mm[0]); } catch (e) { throw new Error('看不懂 AI 的回答：' + txt.slice(0, 80)); }
     if (j.name) $('pName').value = j.name;
     if (j.item) $('pItem').value = j.item;
     if (j.price !== '' && j.price != null) $('pPrice').value = String(j.price).replace(/[^\d]/g, '');
