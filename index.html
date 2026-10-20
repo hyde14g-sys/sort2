@@ -84,7 +84,7 @@
 </head>
 <body>
 <header>
-  <h1>📦 分貨 <small>v2.6</small></h1>
+  <h1>📦 分貨 <small>v2.7</small></h1>
   <span id="qBadge">☁️ 0</span>
   <select id="weekSel" onchange="changeWeek(this.value)"></select>
 </header>
@@ -144,7 +144,7 @@
 <div class="view" id="vMerge">
   <div id="mList">
     <div class="card">
-      <div class="row"><input id="mSearch" placeholder="🔍 找客人" oninput="renderWeek()"><button style="flex:none" onclick="loadWeek()">↻</button></div>
+      <div class="row"><input id="mSearch" placeholder="🔍 找客人" oninput="renderWeek()"><button style="flex:none" onclick="loadWeek()">↻</button><button style="flex:none" onclick="recountWeek()" title="重新計算">🔄</button></div>
       <div class="muted" id="weekInfo" style="margin-top:8px"></div>
     </div>
     <div class="card" style="padding:0" id="custList"></div>
@@ -176,7 +176,7 @@
   <div class="card">
     <b>📋 本週總覽</b>
     <div id="weekSummary" style="margin-top:8px;line-height:1.9"></div>
-    <button style="margin-top:8px" onclick="loadWeek()">↻ 重新整理</button>
+    <button style="margin-top:8px" onclick="loadWeek()">↻ 重新整理</button> <button style="margin-top:8px" id="recountBtn" onclick="recountWeek()">🔄 重新計算</button>
   </div>
   <div class="card muted" style="line-height:1.8">
     ・照片存在雲端，兩支手機會看到同一份資料<br>
@@ -280,16 +280,35 @@
       const s = await getDocs(query(collection(db, "sort_items"), where("week", "==", week), where("name", "==", name)));
       return s.docs.map(d => d.data()).sort((a, b) => a.ts - b.ts);
     },
+    // v2.7：跨週查這個客人所有照片（含已開單）
+    async listByName(names) {
+      const s = await getDocs(query(collection(db, "sort_items"), where("name", "in", names.slice(0, 10))));
+      return s.docs.map(d => d.data()).sort((a, b) => (a.week < b.week ? -1 : a.week > b.week ? 1 : a.ts - b.ts));
+    },
+    // v2.7：用實際照片重算某週的件數/金額（保留已傳送標記）
+    async recountWeek(week) {
+      const s = await getDocs(query(collection(db, "sort_items"), where("week", "==", week)));
+      const counts = {};
+      s.docs.forEach(d => { const it = d.data(); const c = counts[it.name] || (counts[it.name] = { n: 0, sum: 0 }); c.n++; c.sum += it.price || 0; });
+      const old = await getDoc(doc(db, "sort_weeks", week));
+      const base = old.exists() ? old.data() : { week, sent: {} };
+      const data = { ...base, week, counts, updatedAt: Date.now() };
+      await setDoc(doc(db, "sort_weeks", week), data);
+      return data;
+    },
     async existing(ids) {
       const res = await Promise.all(ids.map(id => getDoc(doc(db, "sort_items", id)).then(d => d.exists() ? id : null)));
       return new Set(res.filter(Boolean));
     },
     async getPhoto(path) { return await getBlob(ref(storage, path)); },
     async deleteItem(it, adjustWeek = true) {
+      const cur = await getDoc(doc(db, "sort_items", it.id));
+      if (!cur.exists()) return false;   // v2.7：已經被刪過 → 不再扣計數（避免重複扣）
       try { await deleteObject(ref(storage, it.path)); } catch (e) { if (e.code !== 'storage/object-not-found') throw e; }
       await deleteDoc(doc(db, "sort_items", it.id));
       await setDoc(doc(db, "meta", "sortStorage"), { bytes: increment(-(it.size || 0)) }, { merge: true });
       if (adjustWeek) await setDoc(doc(db, "sort_weeks", it.week), { counts: { [it.name]: { n: increment(-1), sum: increment(-it.price) } } }, { merge: true });
+      return true;
     },
     async changePrice(it, price, blob, newPath) {
       await uploadBytes(ref(storage, newPath), blob, { contentType: 'image/jpeg' });
@@ -726,7 +745,10 @@ function renderWeek() {
   $('weekInfo').textContent = `${weekLabel(week)}　${list.length} 位客人、${cnt} 件、${money(tot)}　｜　已傳 ${sentN} / ${list.length}`;
   $('weekSummary').innerHTML = `${weekLabel(week)}<br>客人：<b>${list.length}</b> 位<br>件數：<b>${cnt}</b> 件<br>金額：<b>${money(tot)}</b><br>已傳訊息：<b>${sentN}</b> / ${list.length} 位`;
   const shown = list.filter(x => !q || x.name.includes(q)).sort((a, b) => (a.sent - b.sent) || a.name.localeCompare(b.name, 'zh-Hant'));
-  $('custList').innerHTML = shown.map(x => `<div class="cust ${x.sent ? 'sent' : ''}" data-cust="${esc(x.name)}"><span class="n">${esc(x.name)}</span><span class="muted">${x.n} 件</span><span class="s">${money(x.sum)}</span></div>`).join('') || '<div class="muted" style="padding:16px">這週還沒有資料</div>';
+  const exact = q && shown.some(x => x.name === q);
+  $('custList').innerHTML = shown.map(x => `<div class="cust ${x.sent ? 'sent' : ''}" data-cust="${esc(x.name)}"><span class="n">${esc(x.name)}</span><span class="muted">${x.n} 件</span><span class="s">${money(x.sum)}</span></div>`).join('')
+    + (q && !exact ? `<div class="cust" data-cust="${esc(q)}" id="searchOpen"><span class="n">🔎 查「${esc(q)}」所有週的照片</span></div>` : '')
+    || '<div class="muted" style="padding:16px">這週還沒有資料（可在上方輸入名字查所有週）</div>';
 }
 document.addEventListener('click', e => { const c = e.target.closest('[data-cust]'); if (c) openCustomer(c.dataset.cust); });
 
@@ -736,13 +758,26 @@ async function getPhotoBlob(it) {
   if (blobCache.has(it.path)) return blobCache.get(it.path);
   const b = await window.sortApi.getPhoto(it.path); blobCache.set(it.path, b); return b;
 }
+function namesFor(name) {   // 標籤名字 + 對應的史塔兔名字
+  const al = window.sortAliases || {}, set = new Set([name]);
+  if (al[name]) set.add(al[name]);
+  Object.entries(al).forEach(([k, v]) => { if (v === name) set.add(k); });
+  return [...set];
+}
+async function recountWeek() {
+  if (!window.firebaseReady) return;
+  $('weekInfo').textContent = '重新計算中...';
+  try { weekData = await window.sortApi.recountWeek(week); renderWeek(); toast('🔄 已依實際照片重新計算'); }
+  catch (e) { $('weekInfo').textContent = '❌ ' + e.message; }
+}
+function itemDate(it) { const d = new Date(it.ts || 0); return it.ts ? `${d.getMonth() + 1}/${d.getDate()}` : (it.week || ''); }
 async function openCustomer(name) {
   dName = name; $('mList').style.display = 'none'; $('mDetail').style.display = 'block';
   $('dName').textContent = name; $('dInfo').textContent = '讀取中...'; $('thumbs').innerHTML = ''; $('itemRows').innerHTML = '';
   resetMerge(); window.scrollTo(0, 0);
   try {
-    dItems = await window.sortApi.listCustomer(week, name);
-    dSel = dItems.slice(0, 12).map((_, i) => i);
+    dItems = await window.sortApi.listByName(namesFor(name));
+    dSel = dItems.map((it, i) => (it.week === week && !it.billedOrder) ? i : -1).filter(i => i >= 0).slice(0, 12);
     renderDetail();
     for (const it of dItems) { try { it._url = URL.createObjectURL(await getPhotoBlob(it)); } catch (e) { it._err = true; } renderDetail(); }
   } catch (e) { $('dInfo').textContent = '❌ ' + e.message; }
@@ -751,12 +786,13 @@ function closeCustomer() { $('mDetail').style.display = 'none'; $('mList').style
 function renderDetail() {
   const tot = dItems.reduce((s, x) => s + x.price, 0), selTot = dSel.reduce((s, i) => s + dItems[i].price, 0);
   const sent = weekData && weekData.sent && weekData.sent[dName];
-  $('dInfo').innerHTML = `本週 ${dItems.length} 件、${money(tot)}　｜　已選 ${dSel.length} 件 ${money(selTot)}` + (sent ? `<br>✅ 已傳送（${esc(sent.by || '')}）` : '');
+  const cw = dItems.filter(x => x.week === week), other = dItems.length - cw.length, billed = dItems.filter(x => x.billedOrder).length;
+  $('dInfo').innerHTML = `本週 ${cw.length} 件、${money(cw.reduce((s, x) => s + x.price, 0))}` + (other ? `　｜　其他週 ${other} 件` : '') + (billed ? `　｜　已開單 ${billed} 件` : '') + `<br>全部 ${dItems.length} 件、${money(tot)}　｜　已選 ${dSel.length} 件 ${money(selTot)}` + (sent ? `<br>✅ 已傳送（${esc(sent.by || '')}）` : '');
   $('sentBtn').textContent = sent ? '↩ 取消已傳' : '✅ 標記已傳';
   const groups = Math.ceil(dItems.length / 12);
   $('groupChips').innerHTML = groups > 1 ? Array.from({ length: groups }, (_, g) => `<span class="chip" data-group="${g}">第 ${g + 1} 組（${g * 12 + 1}～${Math.min(dItems.length, g * 12 + 12)}）</span>`).join('') : '';
   $('thumbs').innerHTML = dItems.map((it, i) => `<div class="thumb ${dSel.includes(i) ? 'sel' : ''}" data-ti="${i}">${it._url ? `<img src="${it._url}">` : `<div style="aspect-ratio:1;display:flex;align-items:center;justify-content:center;color:var(--muted)">${it._err ? '❌' : '⏳'}</div>`}<span class="o">${dSel.indexOf(i) + 1}</span><span class="c">${money(it.price)}</span></div>`).join('');
-  $('itemRows').innerHTML = dItems.map((it, i) => `<div class="item-row">${it._url ? `<img src="${it._url}">` : '<img>'}<div class="t">${i + 1}. ${esc(it.item || '（無品名）')}<br><span class="muted">${esc(it.file)}</span></div><b>${money(it.price)}</b><button data-edit="${i}">改</button><button class="red" data-del="${i}">刪</button></div>`).join('');
+  $('itemRows').innerHTML = dItems.map((it, i) => `<div class="item-row">${it._url ? `<img src="${it._url}">` : '<img>'}<div class="t">${i + 1}. ${esc(it.item || '（無品名）')}<br><span class="muted">📅 ${itemDate(it)}${it.week !== week ? '（其他週）' : ''}　${it.billedOrder ? '<b style="color:var(--green,#4ade80)">已開單</b>' : '<span style="color:#f5c542">未開單</span>'}</span></div><b>${money(it.price)}</b><button data-edit="${i}">改</button><button class="red" data-del="${i}">刪</button></div>`).join('');
 }
 document.addEventListener('click', async e => {
   const t = e.target.closest('[data-ti]');
@@ -855,13 +891,14 @@ async function editPrice(i) {
 }
 async function deleteItem(i) {
   const it = dItems[i];
-  if (!confirm(`刪除第 ${i + 1} 件（${money(it.price)}）？照片也會刪除`)) return;
+  const warn = it.billedOrder ? `\n⚠️ 這件已開單（${it.billedName || ''}），刪除不會改史塔兔的訂單` : '';
+  if (!confirm(`刪除第 ${i + 1} 件（${itemDate(it)}　${money(it.price)}）？照片也會刪除${warn}`)) return;
   try {
-    await window.sortApi.deleteItem(it);
+    const ok = await window.sortApi.deleteItem(it);
     dropLog(it.id);
     dItems.splice(i, 1); dSel = dSel.filter(x => x !== i).map(x => x > i ? x - 1 : x);
-    if (weekData && weekData.counts[dName]) { weekData.counts[dName].n--; weekData.counts[dName].sum -= it.price; }
-    resetMerge(); renderDetail(); toast('已刪除');
+    if (ok && it.week === week && weekData && weekData.counts[it.name]) { weekData.counts[it.name].n--; weekData.counts[it.name].sum -= it.price; }
+    resetMerge(); renderDetail(); toast(ok ? '已刪除' : '這件之前已刪過，已從清單移除');
   } catch (e) { alert('刪除失敗：' + e.message); }
 }
 
