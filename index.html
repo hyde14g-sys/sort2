@@ -84,7 +84,7 @@
 </head>
 <body>
 <header>
-  <h1>📦 分貨 <small>v2.9</small></h1>
+  <h1>📦 分貨 <small>v2.11</small></h1>
   <span id="qBadge">☁️ 0</span>
   <select id="weekSel" onchange="changeWeek(this.value)"></select>
 </header>
@@ -203,7 +203,7 @@
 
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-  import { getFirestore, doc, getDoc, setDoc, deleteDoc, collection, query, where, orderBy, limit, getDocs, increment, deleteField } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import { getFirestore, doc, getDoc, setDoc, deleteDoc, collection, query, where, orderBy, limit, getDocs, increment, deleteField, runTransaction, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
   import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
   import { getStorage, ref, uploadBytes, getBlob, deleteObject } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
 
@@ -265,13 +265,23 @@
   const LIMIT_BYTES = 4.5e9, TARGET_BYTES = 4.4e9;
 
   window.sortApi = {
-    // 上傳一件：照片 → Storage；明細 → sort_items；本週彙總 → sort_weeks（2 筆寫入 + 1 次上傳）
+    // v2.11 上傳一件（冪等）：S1 照片 → Storage（同路徑覆蓋）；S2 交易：讀明細＋墓碑 → 一次寫入 明細／本週統計／空間
+    // 回傳 'ok'（新寫入）、'dup'（之前其實已寫入，回覆遺失）、'tomb'（已被刪除，不再寫回並清掉重傳的照片）
     async uploadItem(item, blob) {
       await uploadBytes(ref(storage, item.path), blob, { contentType: 'image/jpeg' });
-      await setDoc(doc(db, "sort_items", item.id), item);
-      await setDoc(doc(db, "sort_weeks", item.week), { week: item.week, counts: { [item.name]: { n: increment(1), sum: increment(item.price) } }, updatedAt: Date.now() }, { merge: true });
-      await setDoc(doc(db, "meta", "sortStorage"), { bytes: increment(item.size) }, { merge: true });
-      this.cleanup().catch(e => console.warn('清理失敗', e));
+      const itemRef = doc(db, "sort_items", item.id), tombRef = doc(db, "sort_tomb", item.id);
+      const res = await runTransaction(db, async tx => {
+        const [cur, tomb] = [await tx.get(itemRef), await tx.get(tombRef)];
+        if (tomb.exists()) return 'tomb';
+        if (cur.exists()) return 'dup';
+        tx.set(itemRef, item);
+        tx.set(doc(db, "sort_weeks", item.week), { week: item.week, counts: { [item.name]: { n: increment(1), sum: increment(item.price) } }, updatedAt: Date.now() }, { merge: true });
+        tx.set(doc(db, "meta", "sortStorage"), { bytes: increment(item.size) }, { merge: true });
+        return 'ok';
+      });
+      if (res === 'tomb') { try { await deleteObject(ref(storage, item.path)); } catch (e) {} }
+      if (res === 'ok') this.cleanup().catch(e => console.warn('清理失敗', e));
+      return res;
     },
     async saveAlias(star, raw) {
       await setDoc(doc(db, "meta", "sortAliases"), { map: { [star]: raw } }, { merge: true });
@@ -295,6 +305,11 @@
       return s.docs.map(d => d.data()).sort((a, b) => a.ts - b.ts);
     },
     // v2.7：跨週查這個客人所有照片（含已開單）
+    // v2.11：預設只查本週（省讀取、省下載）
+    async listWeekByName(week, names) {
+      const s = await getDocs(query(collection(db, "sort_items"), where("week", "==", week), where("name", "in", names.slice(0, 10))));
+      return s.docs.map(d => d.data()).sort((a, b) => a.ts - b.ts);
+    },
     async listByName(names) {
       const s = await getDocs(query(collection(db, "sort_items"), where("name", "in", names.slice(0, 10))));
       return s.docs.map(d => d.data()).sort((a, b) => (a.week < b.week ? -1 : a.week > b.week ? 1 : a.ts - b.ts));
@@ -315,22 +330,49 @@
       return new Set(res.filter(Boolean));
     },
     async getPhoto(path) { return await getBlob(ref(storage, path)); },
+    // v2.11 刪除（冪等）：先刪照片檔（不存在也沒關係）→ 交易：讀明細，存在才刪除＋寫墓碑＋扣統計（以雲端資料為準）
     async deleteItem(it, adjustWeek = true) {
-      const cur = await getDoc(doc(db, "sort_items", it.id));
-      if (!cur.exists()) return false;   // v2.7：已經被刪過 → 不再扣計數（避免重複扣）
       try { await deleteObject(ref(storage, it.path)); } catch (e) { if (e.code !== 'storage/object-not-found') throw e; }
-      await deleteDoc(doc(db, "sort_items", it.id));
-      await setDoc(doc(db, "meta", "sortStorage"), { bytes: increment(-(it.size || 0)) }, { merge: true });
-      if (adjustWeek) await setDoc(doc(db, "sort_weeks", it.week), { counts: { [it.name]: { n: increment(-1), sum: increment(-it.price) } } }, { merge: true });
-      return true;
+      const itemRef = doc(db, "sort_items", it.id);
+      return await runTransaction(db, async tx => {
+        const cur = await tx.get(itemRef);
+        if (!cur.exists()) return false;                 // 已經被刪過 → 不再扣
+        const d = cur.data();
+        tx.delete(itemRef);
+        tx.set(doc(db, "sort_tomb", it.id), { ts: Date.now(), week: d.week || it.week });
+        tx.set(doc(db, "meta", "sortStorage"), { bytes: increment(-(d.size || 0)) }, { merge: true });
+        if (adjustWeek) tx.set(doc(db, "sort_weeks", d.week), { counts: { [d.name]: { n: increment(-1), sum: increment(-(d.price || 0)) } } }, { merge: true });
+        return true;
+      });
     },
+    // 墓碑保留 14 週（佇列超過 12 週的照片不會自動上傳，所以墓碑一定比佇列活得久）
+    async pruneTombs() {
+      const old = await getDocs(query(collection(db, "sort_tomb"), where("ts", "<", Date.now() - 98 * 864e5), limit(400)));
+      if (old.empty) return 0;
+      const b = writeBatch(db); old.docs.forEach(d => b.delete(doc(db, "sort_tomb", d.id))); await b.commit();
+      return old.size;
+    },
+    // v2.11 改金額（冪等）：新照片先上傳 → 交易以「雲端目前的金額」計算差額 → 成功後才刪舊照片；失敗就清掉新照片
     async changePrice(it, price, blob, newPath) {
       await uploadBytes(ref(storage, newPath), blob, { contentType: 'image/jpeg' });
-      if (newPath !== it.path) { try { await deleteObject(ref(storage, it.path)); } catch (e) {} }
-      const upd = { ...it, price, path: newPath, file: newPath.split('/').pop(), size: blob.size };
-      await setDoc(doc(db, "sort_items", it.id), upd);
-      await setDoc(doc(db, "sort_weeks", it.week), { counts: { [it.name]: { sum: increment(price - it.price) } } }, { merge: true });
-      await setDoc(doc(db, "meta", "sortStorage"), { bytes: increment(blob.size - (it.size || 0)) }, { merge: true });
+      const itemRef = doc(db, "sort_items", it.id);
+      let upd, oldPath;
+      try {
+        upd = await runTransaction(db, async tx => {
+          const cur = await tx.get(itemRef);
+          if (!cur.exists()) { const e = new Error('這件已經被刪除了'); e.code = 'not-found'; throw e; }
+          const d = cur.data(); oldPath = d.path;
+          const u = { ...d, price, path: newPath, file: newPath.split('/').pop(), size: blob.size };
+          tx.set(itemRef, u);
+          if (price !== d.price) tx.set(doc(db, "sort_weeks", d.week), { counts: { [d.name]: { sum: increment(price - d.price) } } }, { merge: true });
+          if (blob.size !== (d.size || 0)) tx.set(doc(db, "meta", "sortStorage"), { bytes: increment(blob.size - (d.size || 0)) }, { merge: true });
+          return u;
+        });
+      } catch (e) {
+        if (newPath !== it.path) { try { await deleteObject(ref(storage, newPath)); } catch (e2) {} }
+        throw e;
+      }
+      for (const p of new Set([oldPath, it.path])) if (p && p !== newPath) { try { await deleteObject(ref(storage, p)); } catch (e) {} }   // 上次回覆遺失時沒刪到的舊照片也一起刪
       return upd;
     },
     async markSent(week, name, on) {
@@ -372,7 +414,9 @@ function ymd(d) { return d.getFullYear() + String(d.getMonth() + 1).padStart(2, 
 // 一週從週二開始（週二～週四直播，週五～週一處理），跟史塔兔統計表一致
 function weekKeyOf(d) { const x = new Date(d); const day = x.getDay(); const back = day === 0 ? 5 : day === 1 ? 6 : day - 2; x.setDate(x.getDate() - back); return ymd(x); }
 function weekLabel(k) { const d = new Date(+k.slice(0, 4), +k.slice(4, 6) - 1, +k.slice(6, 8)); const e = new Date(d); e.setDate(d.getDate() + 6); return `${d.getMonth() + 1}/${d.getDate()}（二）～${e.getMonth() + 1}/${e.getDate()}（一）`; }
-function stampId() { const d = new Date(); return String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0') + String(d.getHours()).padStart(2, '0') + String(d.getMinutes()).padStart(2, '0') + String(d.getSeconds()).padStart(2, '0') + Math.random().toString(36).slice(2, 4); }
+// v2.11：時間（方便人看）＋ 10 碼加密等級亂數（36^10 ≈ 3.6×10^15 種），兩支手機同一秒也不會撞
+function rnd36(n) { const a = new Uint8Array(n); crypto.getRandomValues(a); return Array.from(a, x => (x % 36).toString(36)).join(''); }
+function stampId() { const d = new Date(); return String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0') + String(d.getHours()).padStart(2, '0') + String(d.getMinutes()).padStart(2, '0') + String(d.getSeconds()).padStart(2, '0') + rnd36(10); }
 
 let week = weekKeyOf(new Date());
 function fillWeekSel() {
@@ -392,37 +436,56 @@ function qdb(mode, fn) {
     rq.onsuccess = () => { const tx = rq.result.transaction('q', mode); const r = fn(tx.objectStore('q')); tx.oncomplete = () => res(r && r.result); tx.onerror = () => rej(tx.error); };
   });
 }
-let qCount = 0, qBusy = false, qFail = false;
+let qCount = 0, qBusy = false, qFail = false, qFails = 0, qTimer = null, qStale = 0;
+const STALE_MS = 84 * 864e5;                           // 超過 12 週沒上傳成功 → 不自動上傳（墓碑只保留 14 週）
+function qBackoff(n) { return Math.min(300, 10 * Math.pow(2, Math.max(0, n - 1))) * 1000; }   // 10,20,40,80,160,300,300… 秒
 async function qRefresh() {
-  qCount = (await qdb('readonly', s => s.count())) || 0;
+  const all = (await qdb('readonly', s => s.getAll())) || [];
+  qCount = all.length; qStale = all.filter(j => j.stale).length;
   const b = $('qBadge');
-  b.textContent = qCount ? (qFail ? `⚠️ ${qCount} 件待上傳` : `☁️ 上傳中 ${qCount}`) : '☁️ 已同步';
-  b.style.color = qCount ? (qFail ? 'var(--red)' : 'var(--accent)') : 'var(--green)';
+  b.textContent = !qCount ? '☁️ 已同步' : qStale ? `⚠️ ${qStale} 件超過 12 週未上傳（點我處理）` : qFails >= 5 ? `⚠️ ${qCount} 件上傳失敗（點我重試）` : qFail ? `⚠️ ${qCount} 件待上傳` : `☁️ 上傳中 ${qCount}`;
+  b.style.color = qCount ? ((qFail || qStale) ? 'var(--red)' : 'var(--accent)') : 'var(--green)';
 }
 async function enqueue(item, blob) { await qdb('readwrite', s => s.put({ id: item.id, item, blob })); await qRefresh(); processQueue(); }
+function qSchedule() { clearTimeout(qTimer); qTimer = setTimeout(processQueue, qBackoff(qFails)); }
 async function processQueue() {
   if (qBusy || !window.firebaseReady) return;
-  qBusy = true;
+  qBusy = true; clearTimeout(qTimer);
   try {
     while (true) {
-      const all = await qdb('readonly', s => s.getAll());
-      if (!all || !all.length) { qFail = false; break; }
-      all.sort((a, b) => a.item.ts - b.item.ts);
-      const job = all[0];
+      const all = (await qdb('readonly', s => s.getAll())) || [];
+      const live = all.filter(j => !j.stale);
+      if (!live.length) { qFail = false; qFails = 0; break; }
+      live.sort((a, b) => a.item.ts - b.item.ts);
+      const job = live[0];
+      if (!job.force && Date.now() - job.item.ts > STALE_MS) { job.stale = true; await qdb('readwrite', s => s.put(job)); continue; }
       try {
-        await window.sortApi.uploadItem(job.item, job.blob);
+        const r = await window.sortApi.uploadItem(job.item, job.blob);
         await qdb('readwrite', s => s.delete(job.id));
-        setLog(job.id, { state: 'up' });
-        qFail = false;
+        if (r === 'tomb') { dropLog(job.id); toast('這件在雲端已經被刪除，不再上傳'); } else setLog(job.id, { state: 'up' });
+        qFail = false; qFails = 0;
       } catch (e) {
-        console.warn('上傳失敗，稍後重試', e); qFail = true; await qRefresh();
-        setTimeout(processQueue, 10000); break;
+        qFails++; qFail = true;
+        console.warn(`上傳失敗（第 ${qFails} 次），${qBackoff(qFails) / 1000} 秒後重試`, e);
+        await qRefresh(); qSchedule(); break;
       }
       await qRefresh();
     }
   } finally { qBusy = false; await qRefresh(); }
 }
-window.addEventListener('online', processQueue);
+async function qBadgeClick() {
+  const all = (await qdb('readonly', s => s.getAll())) || [];
+  const st = all.filter(j => j.stale);
+  if (st.length) {
+    const up = confirm(`有 ${st.length} 件照片超過 12 週都沒上傳成功：\n${st.slice(0, 8).map(j => `${j.item.name} ${money(j.item.price)}`).join('\n')}\n\n確定＝還是要上傳（可能是已經被刪掉的舊照片，請確認）\n取消＝問要不要丟掉`);
+    if (up) { for (const j of st) { j.stale = false; j.force = true; await qdb('readwrite', s => s.put(j)); } }
+    else if (confirm(`要從這支手機丟掉這 ${st.length} 件嗎？（丟掉就找不回來）`)) { for (const j of st) { await qdb('readwrite', s => s.delete(j.id)); dropLog(j.id); } }
+  }
+  qFails = Math.min(qFails, 1); processQueue();
+}
+document.addEventListener('click', e => { if (e.target.closest('#qBadge')) qBadgeClick(); });
+window.addEventListener('online', () => { qFails = Math.min(qFails, 1); processQueue(); });
+
 
 // 這支手機的存檔記錄（顯示用）
 function logKey() { return 'sort2_log_' + week; }
@@ -591,6 +654,8 @@ const CIRC = ['', '', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨'];
 function fbEntries() { return Object.entries(window.sortFb || {}); }
 function dispTaken(d) { return fbEntries().some(([, v]) => v.disp === d); }
 // 這個名字有幾位不同的人（不同 FB）
+function fbCount(disp) { return fbEntries().filter(([, v]) => v.disp === disp).length; }
+const fbBadge = d => fbCount(d) > 1 ? ` <span class="muted" title="同一位客人有好幾個 FB">👥${fbCount(d)}</span>` : '';
 function sameNameDisps(name) {
   const raws = new Set(fbEntries().filter(([, v]) => v.raw === name || v.disp === name).map(([, v]) => v.raw));
   return [...new Set(fbEntries().filter(([, v]) => raws.has(v.raw)).map(([, v]) => v.disp))];
@@ -604,9 +669,9 @@ async function resolveFb(key, raw, base) {
   if (others.length) {
     let n = others.length + 1, def = base + (CIRC[n] || '#' + n);
     while (dispTaken(def)) { n++; def = base + (CIRC[n] || '#' + n); }
-    const v = prompt(`又一位「${raw}」（不同的 FB 帳號）\n已經有：${others.join('、')}\n\n這位要叫什麼？（以後掃到這個 FB 都會用這個名字）`, def);
+    const v = prompt(`又一位「${raw}」（不同的 FB 帳號）\n已經有：${others.join('、')}\n\n這位要叫什麼？（以後掃到這個 FB 都會用這個名字）\n※ 如果是同一個人的另一個 FB，就填一樣的名字`, def);
     disp = (v || '').trim() || def;
-    if (dispTaken(disp)) disp = def;
+    if (dispTaken(disp) && disp !== def && !confirm(`「${disp}」已經有了。\n這是同一個人（她的另一個 FB）嗎？\n\n確定＝合併成同一位\n取消＝當成不同人（${def}）`)) disp = def;
   }
   try { await window.sortApi.saveFb(key, { raw, disp }); } catch (e) { console.warn('記住 FB 失敗', e); }
   return disp;
@@ -818,7 +883,7 @@ function renderWeek() {
   $('weekSummary').innerHTML = `${weekLabel(week)}<br>客人：<b>${list.length}</b> 位<br>件數：<b>${cnt}</b> 件<br>金額：<b>${money(tot)}</b><br>已傳訊息：<b>${sentN}</b> / ${list.length} 位`;
   const shown = list.filter(x => !q || x.name.includes(q)).sort((a, b) => (a.sent - b.sent) || a.name.localeCompare(b.name, 'zh-Hant'));
   const exact = q && shown.some(x => x.name === q);
-  $('custList').innerHTML = shown.map(x => `<div class="cust ${x.sent ? 'sent' : ''}" data-cust="${esc(x.name)}"><span class="n">${esc(x.name)}</span><span class="muted">${x.n} 件</span><span class="s">${money(x.sum)}</span></div>`).join('')
+  $('custList').innerHTML = shown.map(x => `<div class="cust ${x.sent ? 'sent' : ''}" data-cust="${esc(x.name)}"><span class="n">${esc(x.name)}${fbBadge(x.name)}</span><span class="muted">${x.n} 件</span><span class="s">${money(x.sum)}</span></div>`).join('')
     + (q && !exact ? `<div class="cust" data-cust="${esc(q)}" id="searchOpen"><span class="n">🔎 查「${esc(q)}」所有週的照片</span></div>` : '')
     || '<div class="muted" style="padding:16px">這週還沒有資料（可在上方輸入名字查所有週）</div>';
 }
@@ -843,15 +908,30 @@ async function recountWeek() {
   catch (e) { $('weekInfo').textContent = '❌ ' + e.message; }
 }
 function itemDate(it) { const d = new Date(it.ts || 0); return it.ts ? `${d.getMonth() + 1}/${d.getDate()}` : (it.week || ''); }
+let dCross = false;
+async function loadThumb(it) { if (it._url || it._err) return; try { it._url = URL.createObjectURL(await getPhotoBlob(it)); } catch (e) { it._err = true; } if (dItems.includes(it)) renderDetail(); }
+// v2.11：「查其他週」才跨週讀；其他週的照片不自動下載（點了才載）
+async function loadCross() {
+  $('dInfo').textContent = '讀取其他週中...';
+  try {
+    const all = await window.sortApi.listByName(namesFor(dName));
+    const keep = new Map(dItems.map(x => [x.id, x]));
+    const selIds = dSel.map(i => dItems[i].id);
+    dItems = all.map(x => keep.get(x.id) || x);
+    dSel = selIds.map(id => dItems.findIndex(x => x.id === id)).filter(i => i >= 0);
+    dCross = true; renderDetail();
+  } catch (e) { $('dInfo').textContent = '❌ ' + e.message; }
+}
 async function openCustomer(name) {
   dName = name; $('mList').style.display = 'none'; $('mDetail').style.display = 'block';
   $('dName').textContent = name; $('dInfo').textContent = '讀取中...'; $('thumbs').innerHTML = ''; $('itemRows').innerHTML = '';
   resetMerge(); window.scrollTo(0, 0);
   try {
-    dItems = await window.sortApi.listByName(namesFor(name));
-    dSel = dItems.map((it, i) => (it.week === week && !it.billedOrder) ? i : -1).filter(i => i >= 0).slice(0, 12);
+    dCross = false;
+    dItems = await window.sortApi.listWeekByName(week, namesFor(name));
+    dSel = dItems.map((it, i) => !it.billedOrder ? i : -1).filter(i => i >= 0).slice(0, 12);
     renderDetail();
-    for (const it of dItems) { try { it._url = URL.createObjectURL(await getPhotoBlob(it)); } catch (e) { it._err = true; } renderDetail(); }
+    for (const it of dItems.slice()) { await loadThumb(it); }
   } catch (e) { $('dInfo').textContent = '❌ ' + e.message; }
 }
 function closeCustomer() { $('mDetail').style.display = 'none'; $('mList').style.display = 'block'; if (weekData) renderWeek(); }
@@ -859,15 +939,16 @@ function renderDetail() {
   const tot = dItems.reduce((s, x) => s + x.price, 0), selTot = dSel.reduce((s, i) => s + dItems[i].price, 0);
   const sent = weekData && weekData.sent && weekData.sent[dName];
   const cw = dItems.filter(x => x.week === week), other = dItems.length - cw.length, billed = dItems.filter(x => x.billedOrder).length;
-  $('dInfo').innerHTML = `本週 ${cw.length} 件、${money(cw.reduce((s, x) => s + x.price, 0))}` + (other ? `　｜　其他週 ${other} 件` : '') + (billed ? `　｜　已開單 ${billed} 件` : '') + `<br>全部 ${dItems.length} 件、${money(tot)}　｜　已選 ${dSel.length} 件 ${money(selTot)}` + (sent ? `<br>✅ 已傳送（${esc(sent.by || '')}）` : '');
+  $('dInfo').innerHTML = `本週 ${cw.length} 件、${money(cw.reduce((s, x) => s + x.price, 0))}` + (other ? `　｜　其他週 ${other} 件` : '') + (billed ? `　｜　已開單 ${billed} 件` : '') + `<br>全部 ${dItems.length} 件、${money(tot)}　｜　已選 ${dSel.length} 件 ${money(selTot)}` + (sent ? `<br>✅ 已傳送（${esc(sent.by || '')}）` : '') + (!dCross ? `<br><button style="margin-top:6px" onclick="loadCross()">📅 查其他週（找舊照片）</button>` : '') + (fbCount(dName) > 1 ? `<br>👥 這位有 ${fbCount(dName)} 個 FB 帳號（合錯了：下次掃到那個 FB 時把名字改掉，按「以後都叫…」就能分開）` : '');
   $('sentBtn').textContent = sent ? '↩ 取消已傳' : '✅ 標記已傳';
   const groups = Math.ceil(dItems.length / 12);
   $('groupChips').innerHTML = groups > 1 ? Array.from({ length: groups }, (_, g) => `<span class="chip" data-group="${g}">第 ${g + 1} 組（${g * 12 + 1}～${Math.min(dItems.length, g * 12 + 12)}）</span>`).join('') : '';
-  $('thumbs').innerHTML = dItems.map((it, i) => `<div class="thumb ${dSel.includes(i) ? 'sel' : ''}" data-ti="${i}">${it._url ? `<img src="${it._url}">` : `<div style="aspect-ratio:1;display:flex;align-items:center;justify-content:center;color:var(--muted)">${it._err ? '❌' : '⏳'}</div>`}<span class="o">${dSel.indexOf(i) + 1}</span><span class="c">${money(it.price)}</span></div>`).join('');
+  $('thumbs').innerHTML = dItems.map((it, i) => `<div class="thumb ${dSel.includes(i) ? 'sel' : ''}" data-ti="${i}">${it._url ? `<img src="${it._url}">` : `<div style="aspect-ratio:1;display:flex;align-items:center;justify-content:center;color:var(--muted)">${it._err ? '❌' : it.week !== week ? '📷 點我看' : '⏳'}</div>`}<span class="o">${dSel.indexOf(i) + 1}</span><span class="c">${money(it.price)}</span></div>`).join('');
   $('itemRows').innerHTML = dItems.map((it, i) => `<div class="item-row">${it._url ? `<img src="${it._url}">` : '<img>'}<div class="t">${i + 1}. ${esc(it.item || '（無品名）')}<br><span class="muted">📅 ${itemDate(it)}${it.week !== week ? '（其他週）' : ''}　${it.billedOrder ? '<b style="color:var(--green,#4ade80)">已開單</b>' : '<span style="color:#f5c542">未開單</span>'}</span></div><b>${money(it.price)}</b><button data-edit="${i}">改</button><button class="red" data-del="${i}">刪</button></div>`).join('');
 }
 document.addEventListener('click', async e => {
   const t = e.target.closest('[data-ti]');
+  if (t && !dItems[+t.dataset.ti]._url && !dItems[+t.dataset.ti]._err && dItems[+t.dataset.ti].week !== week) return loadThumb(dItems[+t.dataset.ti]);
   if (t) { const i = +t.dataset.ti, k = dSel.indexOf(i); if (k >= 0) dSel.splice(k, 1); else if (dSel.length < 12) dSel.push(i); else return toast('一張最多 12 件', 'var(--red)'); resetMerge(); return renderDetail(); }
   const g = e.target.closest('[data-group]');
   if (g) { const s = +g.dataset.group * 12; dSel = dItems.slice(s, s + 12).map((_, i) => s + i); resetMerge(); return renderDetail(); }
@@ -970,6 +1051,7 @@ async function deleteItem(i) {
     dropLog(it.id);
     dItems.splice(i, 1); dSel = dSel.filter(x => x !== i).map(x => x > i ? x - 1 : x);
     if (ok && it.week === week && weekData && weekData.counts[it.name]) { weekData.counts[it.name].n--; weekData.counts[it.name].sum -= it.price; }
+    if (it._url) URL.revokeObjectURL(it._url);
     resetMerge(); renderDetail(); toast(ok ? '已刪除' : '這件之前已刪過，已從清單移除');
   } catch (e) { alert('刪除失敗：' + e.message); }
 }
@@ -989,6 +1071,7 @@ document.addEventListener('keydown', e => {   // 電腦鍵盤也能用
 fillWeekSel(); renderLog(); setStage('scan');
 window.onFirebaseReady = async function () {
   qRefresh(); processQueue(); syncLog();
+  try { const k = 'sort2_tombPrune', last = +localStorage.getItem(k) || 0; if (Date.now() - last > 864e5) { localStorage.setItem(k, Date.now()); window.sortApi.pruneTombs().catch(e => console.warn('清墓碑失敗', e)); } } catch (e) {}
   await startCamera(localStorage.getItem('sort2_cam') || undefined);
 };
 
