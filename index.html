@@ -79,12 +79,16 @@
   .item-row { display:flex; gap:8px; align-items:center; padding:8px 0; border-bottom:1px solid #2a2a36; font-size:0.88rem; }
   .item-row img { width:52px; height:52px; object-fit:cover; border-radius:6px; background:#000; }
   .item-row .t { flex:1; min-width:0; }
+  .item-row button { padding:6px 8px; }
+  .fbtag { display:inline-block; padding:0 6px; border-radius:6px; background:#26324a; color:#9ec5ff; font-size:0.75rem; margin-left:4px; }
+  #dFb { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  #dFb a { display:inline-block; padding:8px 12px; border-radius:10px; background:#1877f2; color:#fff; text-decoration:none; font-weight:700; font-size:0.9rem; }
   .item-row button { padding:6px 10px; font-size:0.8rem; }
 </style>
 </head>
 <body>
 <header>
-  <h1>📦 分貨 <small>v2.11</small></h1>
+  <h1>📦 分貨 <small>v2.12</small></h1>
   <span id="qBadge">☁️ 0</span>
   <select id="weekSel" onchange="changeWeek(this.value)"></select>
 </header>
@@ -153,6 +157,7 @@
     <div class="card">
       <div class="row"><button style="flex:none" onclick="closeCustomer()">←</button><b id="dName" style="font-size:1.15rem"></b></div>
       <div class="muted" id="dInfo" style="margin-top:8px"></div>
+      <div id="dFb"></div>
       <div class="chips" id="groupChips"></div>
     </div>
     <div class="card" id="dPhotos">
@@ -165,7 +170,7 @@
       </div>
     </div>
     <div class="card">
-      <b>明細（可改金額／刪除）</b>
+      <b>明細（可改金額／改客人／刪除）</b>
       <div id="itemRows"></div>
     </div>
   </div>
@@ -374,6 +379,31 @@
       }
       for (const p of new Set([oldPath, it.path])) if (p && p !== newPath) { try { await deleteObject(ref(storage, p)); } catch (e) {} }   // 上次回覆遺失時沒刪到的舊照片也一起刪
       return upd;
+    },
+    // v2.12 改客人（冪等）：一次交易讀這幾件 → 已開單的不改、已經是新名字的不重複算 → 改名字＋把件數／金額從舊名字搬到新名字
+    async renameItems(ids, newName) {
+      return await runTransaction(db, async tx => {
+        const refs = ids.map(id => doc(db, "sort_items", id));
+        const cur = []; for (const r of refs) cur.push(await tx.get(r));
+        const done = [], skipped = [], wk = {};
+        cur.forEach((d, k) => {
+          const id = ids[k];
+          if (!d.exists()) { skipped.push({ id, why: '這件已經被刪除了' }); return; }
+          const x = d.data();
+          if (x.billedOrder) { skipped.push({ id, why: '已經開單給「' + (x.billedName || '') + '」' }); return; }
+          if (x.name === newName) { done.push(id); return; }          // 上次其實改好了（回覆遺失）→ 不重複搬件數
+          tx.set(refs[k], { ...x, name: newName, renamedFrom: x.name, renamedAt: Date.now() });
+          const w = wk[x.week] || (wk[x.week] = {});
+          const o = w[x.name] || (w[x.name] = { n: 0, sum: 0 }); o.n--; o.sum -= (x.price || 0);
+          const nn = w[newName] || (w[newName] = { n: 0, sum: 0 }); nn.n++; nn.sum += (x.price || 0);
+          done.push(id);
+        });
+        for (const [week, m] of Object.entries(wk)) {
+          const counts = {}; for (const [n, v] of Object.entries(m)) counts[n] = { n: increment(v.n), sum: increment(v.sum) };
+          tx.set(doc(db, "sort_weeks", week), { counts, updatedAt: Date.now() }, { merge: true });
+        }
+        return { done, skipped };
+      });
     },
     async markSent(week, name, on) {
       await setDoc(doc(db, "sort_weeks", week), { sent: { [name]: on ? { at: Date.now(), by: window.currentUser } : deleteField() } }, { merge: true });
@@ -934,17 +964,36 @@ async function openCustomer(name) {
     for (const it of dItems.slice()) { await loadThumb(it); }
   } catch (e) { $('dInfo').textContent = '❌ ' + e.message; }
 }
+// v2.12：這位客人的 FB 帳號（照片上的＋記住的），給「點了直接開 FB 判斷是誰」用
+function fbUrlOf(key, url) {
+  if (url && /^https?:\/\//i.test(url)) return url;
+  return key ? 'https://www.facebook.com' + (key.startsWith('/') ? key : '/' + key) : '';
+}
+function dFbList() {
+  const m = new Map();
+  dItems.forEach(it => {
+    if (!it.fbKey) return;
+    const e = m.get(it.fbKey) || { key: it.fbKey, url: '', n: 0 };
+    e.n++; if (!e.url && it.fb) e.url = it.fb; m.set(it.fbKey, e);
+  });
+  fbEntries().filter(([, v]) => v.disp === dName).forEach(([k]) => { if (!m.has(k)) m.set(k, { key: k, url: '', n: 0 }); });
+  return [...m.values()].map(e => ({ ...e, url: fbUrlOf(e.key, e.url) }));
+}
 function closeCustomer() { $('mDetail').style.display = 'none'; $('mList').style.display = 'block'; if (weekData) renderWeek(); }
 function renderDetail() {
   const tot = dItems.reduce((s, x) => s + x.price, 0), selTot = dSel.reduce((s, i) => s + dItems[i].price, 0);
   const sent = weekData && weekData.sent && weekData.sent[dName];
   const cw = dItems.filter(x => x.week === week), other = dItems.length - cw.length, billed = dItems.filter(x => x.billedOrder).length;
-  $('dInfo').innerHTML = `本週 ${cw.length} 件、${money(cw.reduce((s, x) => s + x.price, 0))}` + (other ? `　｜　其他週 ${other} 件` : '') + (billed ? `　｜　已開單 ${billed} 件` : '') + `<br>全部 ${dItems.length} 件、${money(tot)}　｜　已選 ${dSel.length} 件 ${money(selTot)}` + (sent ? `<br>✅ 已傳送（${esc(sent.by || '')}）` : '') + (!dCross ? `<br><button style="margin-top:6px" onclick="loadCross()">📅 查其他週（找舊照片）</button>` : '') + (fbCount(dName) > 1 ? `<br>👥 這位有 ${fbCount(dName)} 個 FB 帳號（合錯了：下次掃到那個 FB 時把名字改掉，按「以後都叫…」就能分開）` : '');
+  $('dInfo').innerHTML = `本週 ${cw.length} 件、${money(cw.reduce((s, x) => s + x.price, 0))}` + (other ? `　｜　其他週 ${other} 件` : '') + (billed ? `　｜　已開單 ${billed} 件` : '') + `<br>全部 ${dItems.length} 件、${money(tot)}　｜　已選 ${dSel.length} 件 ${money(selTot)}` + (sent ? `<br>✅ 已傳送（${esc(sent.by || '')}）` : '') + (!dCross ? `<br><button style="margin-top:6px" onclick="loadCross()">📅 查其他週（找舊照片）</button>` : '') + (fbCount(dName) > 1 ? `<br>👥 這位有 ${fbCount(dName)} 個 FB 帳號：點下面的 FB 按鈕看是誰；不是同一個人的話，按那幾件的「改名」分出去` : '');
+  const fbl = dFbList();
+  $('dFb').innerHTML = fbl.map((f, k) => `<a href="${esc(f.url)}" target="_blank" rel="noopener noreferrer">👤 FB${fbl.length > 1 ? k + 1 : ''}（${f.n} 件）</a>`).join('');
   $('sentBtn').textContent = sent ? '↩ 取消已傳' : '✅ 標記已傳';
   const groups = Math.ceil(dItems.length / 12);
   $('groupChips').innerHTML = groups > 1 ? Array.from({ length: groups }, (_, g) => `<span class="chip" data-group="${g}">第 ${g + 1} 組（${g * 12 + 1}～${Math.min(dItems.length, g * 12 + 12)}）</span>`).join('') : '';
   $('thumbs').innerHTML = dItems.map((it, i) => `<div class="thumb ${dSel.includes(i) ? 'sel' : ''}" data-ti="${i}">${it._url ? `<img src="${it._url}">` : `<div style="aspect-ratio:1;display:flex;align-items:center;justify-content:center;color:var(--muted)">${it._err ? '❌' : it.week !== week ? '📷 點我看' : '⏳'}</div>`}<span class="o">${dSel.indexOf(i) + 1}</span><span class="c">${money(it.price)}</span></div>`).join('');
-  $('itemRows').innerHTML = dItems.map((it, i) => `<div class="item-row">${it._url ? `<img src="${it._url}">` : '<img>'}<div class="t">${i + 1}. ${esc(it.item || '（無品名）')}<br><span class="muted">📅 ${itemDate(it)}${it.week !== week ? '（其他週）' : ''}　${it.billedOrder ? '<b style="color:var(--green,#4ade80)">已開單</b>' : '<span style="color:#f5c542">未開單</span>'}</span></div><b>${money(it.price)}</b><button data-edit="${i}">改</button><button class="red" data-del="${i}">刪</button></div>`).join('');
+  const fbIdx = new Map(fbl.map((f, k) => [f.key, k + 1]));
+  const fbTag = it => it.fbKey ? (fbl.length > 1 ? `<span class="fbtag">FB${fbIdx.get(it.fbKey)}</span>` : '') : '<span class="fbtag">✍️手動</span>';
+  $('itemRows').innerHTML = dItems.map((it, i) => `<div class="item-row">${it._url ? `<img src="${it._url}">` : '<img>'}<div class="t">${i + 1}. ${esc(it.item || '（無品名）')}${fbTag(it)}<br><span class="muted">📅 ${itemDate(it)}${it.week !== week ? '（其他週）' : ''}　${it.billedOrder ? '<b style="color:var(--green,#4ade80)">已開單</b>' : '<span style="color:#f5c542">未開單</span>'}</span></div><b>${money(it.price)}</b><button data-edit="${i}">改$</button><button data-ren="${i}">改名</button><button class="red" data-del="${i}">刪</button></div>`).join('');
 }
 document.addEventListener('click', async e => {
   const t = e.target.closest('[data-ti]');
@@ -953,6 +1002,7 @@ document.addEventListener('click', async e => {
   const g = e.target.closest('[data-group]');
   if (g) { const s = +g.dataset.group * 12; dSel = dItems.slice(s, s + 12).map((_, i) => s + i); resetMerge(); return renderDetail(); }
   const ed = e.target.closest('[data-edit]'); if (ed) return editPrice(+ed.dataset.edit);
+  const rn = e.target.closest('[data-ren]'); if (rn) return renameItem(+rn.dataset.ren);
   const dl = e.target.closest('[data-del]'); if (dl) return deleteItem(+dl.dataset.del);
 });
 function resetMerge() { mergeBlob = null; $('mergeCanvas').style.display = 'none'; $('shareRow').style.display = 'none'; }
@@ -1041,6 +1091,44 @@ async function editPrice(i) {
     if (weekData && weekData.counts[dName]) weekData.counts[dName].sum += price - it.price;
     resetMerge(); renderDetail(); toast('已改成 ' + money(price));
   } catch (e) { alert('修改失敗：' + e.message); }
+}
+// v2.12 改客人：同一個 FB 的其他幾件可以一起改；可以順便讓「以後這個 FB 都叫新名字」
+async function renameItem(i) {
+  const it = dItems[i];
+  if (it.billedOrder) return alert(`這件已經開單給「${it.billedName || ''}」，不能在這裡改客人。\n要改請先到史塔兔處理那張單。`);
+  const v = prompt(`第 ${i + 1} 件（${money(it.price)}${it.item ? '　' + it.item : ''}）要改成哪位客人？`, it.name);
+  if (v === null) return;
+  const nn = v.trim();
+  if (!nn || nn === it.name) return;
+  let ids = [it.id];
+  const same = it.fbKey ? dItems.filter(x => x.id !== it.id && x.fbKey === it.fbKey && x.name === it.name && !x.billedOrder) : [];
+  if (same.length && confirm(`同一個 FB 的另外 ${same.length} 件，也一起改成「${nn}」嗎？\n（按取消＝只改這一件）`)) ids = ids.concat(same.map(x => x.id));
+  const remember = !!it.fbKey && confirm(`以後掃到這個 FB 帳號，都叫「${nn}」嗎？\n（按取消＝只改這幾件，以後掃到還是叫「${it.name}」）`);
+  let r;
+  try { r = await window.sortApi.renameItems(ids, nn); }
+  catch (e) { return alert('改名失敗：' + e.message + '\n（網路不穩時可能其實已經改好了；直接再按一次「改名」，不會重複算）'); }
+  if (remember) {
+    const old = (window.sortFb || {})[it.fbKey];
+    try { await window.sortApi.saveFb(it.fbKey, { raw: (old && old.raw) || it.name, disp: nn }); }
+    catch (e) { alert('照片已改好，但「以後都叫」沒有記住：' + e.message + '\n下次掃到這個 FB 時再改一次名字就好'); }
+  }
+  for (const id of r.done) {
+    setLog(id, { name: nn });
+    const x = dItems.find(y => y.id === id);
+    if (x && x.name !== nn && x.week === week && weekData) {
+      const c = weekData.counts || (weekData.counts = {});
+      if (c[x.name]) { c[x.name].n--; c[x.name].sum -= x.price; }
+      const t = c[nn] || (c[nn] = { n: 0, sum: 0 }); t.n++; t.sum += x.price;
+    }
+  }
+  const gone = new Set(r.done);
+  const selIds = dSel.map(k => dItems[k].id).filter(id => !gone.has(id));
+  dItems.filter(x => gone.has(x.id) && x._url).forEach(x => URL.revokeObjectURL(x._url));
+  dItems = dItems.filter(x => !gone.has(x.id));
+  dSel = selIds.map(id => dItems.findIndex(x => x.id === id)).filter(k => k >= 0);
+  resetMerge(); renderDetail();
+  toast(`已把 ${r.done.length} 件改到「${nn}」`);
+  if (r.skipped.length) alert(`有 ${r.skipped.length} 件沒有改：\n` + r.skipped.map(x => '· ' + x.why).join('\n'));
 }
 async function deleteItem(i) {
   const it = dItems[i];
