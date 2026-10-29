@@ -88,7 +88,7 @@
 </head>
 <body>
 <header>
-  <h1>📦 分貨 <small>v2.12</small></h1>
+  <h1>📦 分貨 <small>v2.13</small></h1>
   <span id="qBadge">☁️ 0</span>
   <select id="weekSel" onchange="changeWeek(this.value)"></select>
 </header>
@@ -709,15 +709,21 @@ async function resolveFb(key, raw, base) {
 
 // ── 名字對應（v2.3）──
 const normName = n => String(n || '').replace(/[（(][^）)]*[）)]/g, '').replace(/[\s　@#＠]/g, '').toLowerCase();
+// v2.13：喊單讀取器對「同名不同 FB」的第 2 位起，會在名字後面加符號（▲■★●♥◆▼◎）。
+// 帶符號＝讀取器已確認是不同人 → 不拿去配沒符號的名字（不用別名、不列相似建議）
+const SYM_RE = /[▲■★●♥◆▼◎△□☆○♡◇▽]$/;
+const hasSym = n => SYM_RE.test(String(n || '').trim());
+const stripSym = n => String(n || '').trim().replace(SYM_RE, '').trim();
 function starNameOf(raw) {
   const all = window.customerNames || [];
   if (all.includes(raw)) return raw;
+  if (hasSym(raw)) return null;   // v2.13：帶符號只認一模一樣的名字，不走別名
   const al = window.sortAliases || {};
   return Object.keys(al).find(k => al[k] === raw) || null;
 }
 function similarNames(raw) {
-  const n0 = normName(raw); if (!n0) return [];
-  return (window.customerNames || []).filter(x => x !== raw && (normName(x) === n0 || (n0.length >= 2 && (normName(x).includes(n0) || n0.includes(normName(x)) && normName(x).length >= 2)))).slice(0, 4);
+  const n0 = normName(raw); if (!n0 || hasSym(raw)) return [];   // v2.13：帶符號的不給相似建議
+  return (window.customerNames || []).filter(x => x !== raw && !hasSym(x) && (normName(x) === n0 || (n0.length >= 2 && (normName(x).includes(n0) || n0.includes(normName(x)) && normName(x).length >= 2)))).slice(0, 4);
 }
 async function pickAlias(star) {
   const raw = cur && cur.rawName; if (!raw) return;
@@ -743,9 +749,12 @@ function updateWarn() {
   const notIn = name && all.length && !all.includes(name) && !(cur.fbDisp && cur.fbDisp !== cur.rawName && name === cur.fbDisp);
   const sim = notIn && cur.rawName && name === cur.rawName ? similarNames(name) : [];
   if (sim.length) w.push(`標籤上的「${esc(name)}」不在名單裡，是這位嗎？（選一次就會記住）<div style="margin-top:6px">` + sim.map(x => `<span class="chip sug" data-aliasto="${esc(x)}" style="margin:0 6px 6px 0">✅ ${esc(x)}</span>`).join('') + '</div>');
+  else if (notIn && hasSym(name)) w.push(`「${esc(name)}」是同名的另一位客人（喊單讀取器已標記，跟「${esc(stripSym(name))}」是不同人）。史塔兔名單還沒有她，開單前要先新增這位客人`);
   else if (notIn && !all.some(n => n.includes(name))) w.push(`「${esc(name)}」不在客戶名單裡（新客人或名字有誤）`);
   const same = !cur.fbKey && name ? sameNameDisps(name) : [];
   if (same.length > 1 && fbEntries().some(([, v]) => v.raw === name)) w.push(`有 ${same.length} 位不同的人叫「${esc(name)}」，這件是誰的？<div style="margin-top:6px">` + same.map(x => `<span class="chip sug" data-pickdisp="${esc(x)}" style="margin:0 6px 6px 0">👤 ${esc(x)}</span>`).join('') + '</div>');
+  // v2.13：標籤是「林秋雲▲」，但這個 FB 以前被記成「林秋雲」→ 提醒可能合錯了
+  if (cur.fbKey && hasSym(cur.rawName) && name === stripSym(cur.rawName)) w.push(`標籤上是「${esc(cur.rawName)}」，但這個 FB 之前被記成「${esc(name)}」。喊單讀取器判斷她們是<b>不同的兩個人</b>，除非確定是同一人的另一個 FB，請改回：<div style="margin-top:6px"><span class="chip sug" data-pickdisp="${esc(cur.rawName)}" style="margin:0 6px 6px 0">👤 ${esc(cur.rawName)}</span></div>（選了之後按確定，會問「以後這個 FB 都叫…」，按確定就永久分開）`);
   const last = getLog().slice(-1)[0];
   if (last && cur.qrRaw && last.qrRaw === cur.qrRaw) w.push('跟上一件的標籤完全相同，確定是另一件嗎？');
   $('pWarn').innerHTML = w.map(x => `<div class="warn">⚠️ ${x}</div>`).join('');
